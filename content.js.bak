@@ -1,0 +1,569 @@
+// ===== Global State =====
+let activeElement = null;
+let currentErrors = [];
+let ignoredWords = new Set();
+let debounceTimer = null;
+let badge = null;
+let suggestionCard = null;
+let currentSuggestionError = null;
+
+// ===== Initialization =====
+function init() {
+    console.log('🎯 Khmer Spell Checker v2.0 - Content Script Loaded!');
+    if (document.getElementById('kh-checker-badge')) return;
+
+    createBadge();
+    createSuggestionCard();
+    setupEventListeners();
+}
+
+// ===== UI Creation =====
+function createBadge() {
+    badge = document.createElement('div');
+    badge.id = 'kh-checker-badge';
+    badge.className = 'kh-checker-badge';
+    badge.style.display = 'none';
+    badge.textContent = '0';
+
+    badge.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (currentErrors.length > 0) {
+            showAllErrorsPanel();
+        }
+    });
+
+    document.body.appendChild(badge);
+}
+
+function createSuggestionCard() {
+    suggestionCard = document.createElement('div');
+    suggestionCard.id = 'kh-suggestion-card';
+    suggestionCard.className = 'kh-suggestion-card hidden';
+
+    suggestionCard.innerHTML = `
+        <div class="kh-card-header">
+            <span class="kh-error-word"></span>
+            <button class="kh-card-close">×</button>
+        </div>
+        <div class="kh-card-body">
+            <p class="kh-card-label">Suggested corrections:</p>
+            <div class="kh-card-suggestions"></div>
+        </div>
+        <div class="kh-card-footer">
+            <button class="kh-card-ignore">Ignore</button>
+        </div>
+    `;
+
+    document.body.appendChild(suggestionCard);
+
+    // Event listeners
+    suggestionCard.querySelector('.kh-card-close').addEventListener('click', hideSuggestionCard);
+    suggestionCard.querySelector('.kh-card-ignore').addEventListener('click', handleIgnoreError);
+
+    // Prevent card from closing when clicking inside it
+    suggestionCard.addEventListener('click', (e) => {
+        e.stopPropagation();
+    });
+}
+
+// ===== Event Listeners =====
+function setupEventListeners() {
+    // Monitor focus on editable elements
+    document.addEventListener('focusin', handleFocusIn, true);
+    document.addEventListener('focusout', handleFocusOut, true);
+
+    // Click outside to close card (use bubble phase, not capture)
+    document.addEventListener('click', (e) => {
+        // Check if click is inside card or on a highlight marker
+        if (suggestionCard && !suggestionCard.classList.contains('hidden')) {
+            const clickedInsideCard = suggestionCard.contains(e.target);
+            const clickedOnMarker = e.target.closest('.kh-highlight-marker');
+            const clickedOnBadge = e.target === badge || (badge && badge.contains(e.target));
+
+            if (!clickedInsideCard && !clickedOnMarker && !clickedOnBadge) {
+                hideSuggestionCard();
+            }
+        }
+    }, false); // Use bubble phase, not capture
+}
+
+function handleFocusIn(e) {
+    const target = e.target;
+
+    if (!isEditable(target)) return;
+
+    activeElement = target;
+
+    // Add input listener
+    target.addEventListener('input', handleInput);
+    target.addEventListener('click', handleClick);
+
+    // Initial check
+    checkText(target);
+    updateBadgePosition();
+}
+
+function handleFocusOut(e) {
+    setTimeout(() => {
+        // Check if focus moved to our UI
+        if (document.activeElement !== activeElement &&
+            !suggestionCard.contains(document.activeElement) &&
+            e.relatedTarget !== badge) {
+            cleanup();
+        }
+    }, 200);
+}
+
+function handleInput() {
+    if (!activeElement) return;
+
+    // Hide badge while typing
+    if (badge) badge.style.display = 'none';
+    hideSuggestionCard();
+    clearHighlights();
+
+    // Debounce check
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+        checkText(activeElement);
+    }, 800);
+}
+
+function handleClick(e) {
+    // Check if clicked on highlighted error
+    const marker = e.target.closest('.kh-highlight-marker');
+    if (marker) {
+        e.preventDefault();
+        e.stopPropagation();
+        const errorIndex = parseInt(marker.dataset.errorIndex);
+        const error = currentErrors[errorIndex];
+        if (error) {
+            showSuggestionCard(error, e.clientX, e.clientY);
+        }
+    }
+}
+
+// ===== Utilities =====
+function isEditable(el) {
+    return (el.tagName === 'TEXTAREA' ||
+        (el.tagName === 'INPUT' && el.type === 'text') ||
+        el.isContentEditable);
+}
+
+function getText(el) {
+    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+        return el.value;
+    } else {
+        return el.innerText || el.textContent || '';
+    }
+}
+
+function setText(el, text) {
+    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+        el.value = text;
+    } else {
+        el.innerText = text;
+    }
+}
+
+function cleanup() {
+    if (activeElement) {
+        activeElement.removeEventListener('input', handleInput);
+        activeElement.removeEventListener('click', handleClick);
+    }
+
+    clearHighlights();
+    if (badge) badge.style.display = 'none';
+    hideSuggestionCard();
+    currentErrors = [];
+    activeElement = null;
+}
+
+// ===== Spell Checking =====
+async function checkText(element) {
+    if (!element) return;
+
+    const text = getText(element);
+    if (!text.trim()) {
+        currentErrors = [];
+        updateBadge();
+        clearHighlights();
+        return;
+    }
+
+    setBadgeLoading(true);
+
+    try {
+        const response = await chrome.runtime.sendMessage({
+            action: 'checkText',
+            text: text
+        });
+
+        if (response && response.success) {
+            processResults(response.data, text);
+        }
+    } catch (error) {
+        console.error('Spell check error:', error);
+    } finally {
+        setBadgeLoading(false);
+    }
+}
+
+function processResults(data, text) {
+    const { tokens, errors } = data;
+
+    // Build error list with positions
+    currentErrors = [];
+    let position = 0;
+
+    tokens.forEach((token, index) => {
+        const error = errors.find(e => e.index === index);
+
+        if (error && !ignoredWords.has(token)) {
+            currentErrors.push({
+                word: token,
+                start: position,
+                end: position + token.length,
+                suggestions: error.suggestions.map(s => s.word).slice(0, 5),
+                index: currentErrors.length
+            });
+        }
+
+        position += token.length;
+    });
+
+    updateBadge();
+    renderHighlights();
+}
+
+// ===== Badge =====
+function updateBadge() {
+    if (!badge) return;
+
+    if (currentErrors.length > 0) {
+        badge.textContent = currentErrors.length;
+        badge.className = 'kh-checker-badge has-errors';
+        badge.style.display = 'flex';
+    } else {
+        badge.textContent = '✓';
+        badge.className = 'kh-checker-badge no-errors';
+        badge.style.display = 'flex';
+    }
+
+    updateBadgePosition();
+}
+
+function setBadgeLoading(isLoading) {
+    if (!badge) return;
+
+    if (isLoading) {
+        badge.className = 'kh-checker-badge loading';
+        badge.textContent = '⟳';
+    }
+}
+
+function updateBadgePosition() {
+    if (!activeElement || !badge) return;
+
+    const rect = activeElement.getBoundingClientRect();
+    let top = rect.bottom - 24;
+    let left = rect.right - 24;
+
+    // Try to get cursor position
+    try {
+        const selection = window.getSelection();
+        if (selection.rangeCount > 0) {
+            const range = selection.getRangeAt(0);
+            const r = range.getBoundingClientRect();
+            if (r.top !== 0 || r.bottom !== 0) {
+                top = r.bottom + 5;
+                left = r.right + 5;
+            }
+        }
+    } catch (e) { /* ignore */ }
+
+    badge.style.top = top + 'px';
+    badge.style.left = left + 'px';
+}
+
+function showAllErrorsPanel() {
+    if (currentErrors.length === 0) return;
+
+    // Create a panel showing all errors
+    const errorWord = suggestionCard.querySelector('.kh-error-word');
+    const cardBody = suggestionCard.querySelector('.kh-card-body');
+
+    // Update header to show error count
+    errorWord.textContent = `${currentErrors.length} ${currentErrors.length === 1 ? 'Error' : 'Errors'}`;
+
+    // Clear and rebuild body with all errors
+    cardBody.innerHTML = '';
+
+    currentErrors.forEach((error, index) => {
+        const errorItem = document.createElement('div');
+        errorItem.className = 'kh-error-item';
+        errorItem.style.cssText = `
+            padding: 12px;
+            border-bottom: 1px solid rgba(51, 65, 85, 0.3);
+            cursor: pointer;
+            transition: background 0.2s ease;
+        `;
+
+        errorItem.innerHTML = `
+            <div style="font-family: 'Hanuman', serif; color: #fca5a5; font-weight: 600; margin-bottom: 8px;">
+                ${escapeHtml(error.word)}
+            </div>
+            <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+                ${error.suggestions.map(s => `
+                    <span class="kh-suggestion-chip" data-error-index="${index}" data-suggestion="${escapeHtml(s)}" 
+                          style="padding: 4px 10px; font-size: 13px;">
+                        ${escapeHtml(s)}
+                    </span>
+                `).join('')}
+            </div>
+        `;
+
+        // Click on error item to show its suggestions
+        errorItem.addEventListener('click', (e) => {
+            if (!e.target.classList.contains('kh-suggestion-chip')) {
+                showSuggestionCard(error, e.clientX, e.clientY);
+            }
+        });
+
+        // Click on suggestion chip to apply
+        errorItem.querySelectorAll('.kh-suggestion-chip').forEach(chip => {
+            chip.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const errorIndex = parseInt(chip.dataset.errorIndex);
+                const suggestion = chip.dataset.suggestion;
+                applySuggestion(currentErrors[errorIndex], suggestion);
+            });
+        });
+
+        cardBody.appendChild(errorItem);
+    });
+
+    // Position near badge
+    const rect = badge.getBoundingClientRect();
+    positionSuggestionCard(rect.left, rect.bottom + 5);
+
+    // Show card
+    suggestionCard.classList.remove('hidden');
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// ===== Highlighting =====
+function renderHighlights() {
+    clearHighlights();
+
+    if (!activeElement || currentErrors.length === 0) return;
+
+    currentErrors.forEach((error, index) => {
+        const marker = createHighlightMarker(error, index);
+        if (marker) {
+            document.body.appendChild(marker);
+        }
+    });
+}
+
+function createHighlightMarker(error, index) {
+    if (!activeElement) return null;
+
+    const text = getText(activeElement);
+
+    // For contenteditable (like Gmail), use Range API
+    if (activeElement.isContentEditable) {
+        try {
+            const walker = document.createTreeWalker(
+                activeElement,
+                NodeFilter.SHOW_TEXT,
+                null,
+                false
+            );
+
+            let currentOffset = 0;
+            let node;
+
+            while (node = walker.nextNode()) {
+                const nodeLength = node.nodeValue.length;
+                const nodeStart = currentOffset;
+                const nodeEnd = currentOffset + nodeLength;
+
+                // Check if this node contains the error
+                if (nodeStart <= error.start && nodeEnd >= error.end) {
+                    const range = document.createRange();
+                    range.setStart(node, error.start - nodeStart);
+                    range.setEnd(node, error.end - nodeStart);
+
+                    const rects = range.getClientRects();
+                    if (rects.length > 0) {
+                        const rect = rects[0];
+
+                        const marker = document.createElement('div');
+                        marker.className = 'kh-highlight-marker';
+                        marker.dataset.errorIndex = index;
+                        marker.style.position = 'fixed';
+                        marker.style.left = rect.left + 'px';
+                        marker.style.top = rect.bottom - 2 + 'px';
+                        marker.style.width = rect.width + 'px';
+                        marker.style.height = '2px';
+
+                        marker.addEventListener('click', (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            showSuggestionCard(error, e.clientX, e.clientY);
+                        });
+
+                        return marker;
+                    }
+                }
+
+                currentOffset = nodeEnd;
+            }
+        } catch (e) {
+            console.error('Error creating highlight:', e);
+        }
+        return null;
+    }
+
+    // For textarea/input
+    if (activeElement.tagName === 'TEXTAREA' || activeElement.tagName === 'INPUT') {
+        // Create a temporary element to measure
+        const temp = document.createElement('div');
+        temp.style.cssText = window.getComputedStyle(activeElement).cssText;
+        temp.style.position = 'absolute';
+        temp.style.visibility = 'hidden';
+        temp.style.whiteSpace = 'pre-wrap';
+        temp.textContent = text.substring(0, error.start);
+        document.body.appendChild(temp);
+
+        const rect = activeElement.getBoundingClientRect();
+        const tempRect = temp.getBoundingClientRect();
+
+        const marker = document.createElement('div');
+        marker.className = 'kh-highlight-marker';
+        marker.dataset.errorIndex = index;
+        marker.style.position = 'fixed';
+        marker.style.left = (rect.left + tempRect.width) + 'px';
+        marker.style.top = (rect.top + tempRect.height) + 'px';
+        marker.style.width = '50px'; // Approximate
+        marker.style.height = '2px';
+
+        document.body.removeChild(temp);
+
+        marker.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            showSuggestionCard(error, e.clientX, e.clientY);
+        });
+
+        return marker;
+    }
+
+    return null;
+}
+
+function clearHighlights() {
+    document.querySelectorAll('.kh-highlight-marker').forEach(el => el.remove());
+}
+
+// ===== Suggestion Card =====
+function showSuggestionCard(error, x, y) {
+    currentSuggestionError = error;
+
+    // Update content
+    const errorWord = suggestionCard.querySelector('.kh-error-word');
+    const suggestionsContainer = suggestionCard.querySelector('.kh-card-suggestions');
+
+    errorWord.textContent = error.word;
+    suggestionsContainer.innerHTML = '';
+
+    error.suggestions.forEach(suggestion => {
+        const chip = document.createElement('div');
+        chip.className = 'kh-suggestion-chip';
+        chip.textContent = suggestion;
+        chip.addEventListener('click', (e) => {
+            e.stopPropagation();
+            applySuggestion(error, suggestion);
+        });
+        suggestionsContainer.appendChild(chip);
+    });
+
+    // Position card
+    positionSuggestionCard(x, y);
+
+    // Show card
+    suggestionCard.classList.remove('hidden');
+}
+
+function positionSuggestionCard(x, y) {
+    const cardWidth = 340;
+    const cardHeight = 300;
+    const padding = 10;
+
+    let left = x - cardWidth / 2;
+    let top = y + padding;
+
+    // Keep in viewport
+    if (left < padding) left = padding;
+    if (left + cardWidth > window.innerWidth - padding) {
+        left = window.innerWidth - cardWidth - padding;
+    }
+    if (top + cardHeight > window.innerHeight - padding) {
+        top = y - cardHeight - padding;
+    }
+
+    suggestionCard.style.left = left + 'px';
+    suggestionCard.style.top = top + 'px';
+}
+
+function hideSuggestionCard() {
+    suggestionCard.classList.add('hidden');
+    currentSuggestionError = null;
+}
+
+// ===== Actions =====
+function applySuggestion(error, suggestion) {
+    if (!activeElement) return;
+
+    const text = getText(activeElement);
+    const newText = text.substring(0, error.start) + suggestion + text.substring(error.end);
+    setText(activeElement, newText);
+
+    // Trigger input event
+    activeElement.dispatchEvent(new Event('input', { bubbles: true }));
+
+    hideSuggestionCard();
+
+    // Re-check
+    setTimeout(() => checkText(activeElement), 100);
+}
+
+function handleIgnoreError() {
+    if (!currentSuggestionError) return;
+
+    ignoredWords.add(currentSuggestionError.word);
+
+    // Remove from current errors
+    const index = currentErrors.findIndex(e => e.index === currentSuggestionError.index);
+    if (index !== -1) {
+        currentErrors.splice(index, 1);
+    }
+
+    updateBadge();
+    renderHighlights();
+    hideSuggestionCard();
+}
+
+// ===== Initialize =====
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+} else {
+    init();
+}
